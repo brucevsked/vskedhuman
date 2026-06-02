@@ -10,6 +10,8 @@ Human movement and biomechanics
 Virtual patients (for medical education or simulation)  
 
 
+## 20260602
+add dna base class A, C, G, T
 
 ## 20251104
 add human id and name
