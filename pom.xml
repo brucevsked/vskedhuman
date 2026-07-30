@@ -19,12 +19,12 @@
 		<maven.compiler.encoding>UTF-8</maven.compiler.encoding>
 
 		<!-- java jdk 版本声明 可变更 根据自己配置去匹配 -->
-		<java.version>21</java.version>
+		<java.version>17</java.version>
 		<maven.compiler.source>${java.version}</maven.compiler.source>
 		<maven.compiler.target>${java.version}</maven.compiler.target>
 		<maven.deploy.skip>true</maven.deploy.skip>
 		<maven.install.skip>true</maven.install.skip>
-	    <mavenCompilerPlugin.version>3.14.0</mavenCompilerPlugin.version>
+	    <mavenCompilerPlugin.version>3.10.1</mavenCompilerPlugin.version>
 		<mavenSurefirePlugin.version>3.5.2</mavenSurefirePlugin.version>
 
 		<testng.version>7.12.0</testng.version>
@@ -106,6 +106,12 @@
 			<artifactId>spring-boot-starter-log4j2</artifactId>
 		</dependency>
 		<!-- log4j end -->
+		<!-- Apache Commons Math3 -->
+		<dependency>
+			<groupId>org.apache.commons</groupId>
+			<artifactId>commons-math3</artifactId>
+			<version>3.6.1</version>
+		</dependency>
 	</dependencies>
 
 	<build>
