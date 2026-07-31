@@ -5,93 +5,112 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * LDA 分类器：自适应正则化
+ * 二分类 LDA：自适应正则化
+ * 训练时自动记住两个类别标签，预测时无需传入。
  */
 public class LDAClassifier {
 
     private RealVector weights;
-    private double threshold; // 769 if projection > threshold, else 770
+    private double threshold;
+    private int labelA; // 训练时 clA（投影值高的一侧）的标签
+    private int labelB; // 训练时 clB 的标签
 
     /**
-     * 用预提取的特征向量和标签训练
+     * 用特征向量和标签训练。自动按标签分成两类并记住顺序。
      */
-    public void train(List<double[]> featuresList, List<Integer> labels) {
-        List<RealVector> classLeft = new ArrayList<>();
-        List<RealVector> classRight = new ArrayList<>();
-
-        for (int i = 0; i < featuresList.size(); i++) {
-            RealVector f = new ArrayRealVector(featuresList.get(i));
-            if (labels.get(i) == 769) classLeft.add(f);
-            else classRight.add(f);
+    public void train(List<double[]> features, List<Integer> labels) {
+        // 确定两个类别
+        this.labelA = labels.get(0);
+        this.labelB = labels.get(0);
+        for (int lb : labels) {
+            if (lb != labelA) { labelB = lb; break; }
         }
-
-        if (classLeft.isEmpty() || classRight.isEmpty()) {
-            System.err.println("LDA 训练失败：某一类没有样本");
+        if (labelA == labelB) {
+            System.err.printf("LDA 训练失败：数据只有一类 (%d)%n", labelA);
             return;
         }
 
-        int dim = classLeft.get(0).getDimension();
-        System.out.printf("  LDA: 左手=%d, 右手=%d, 维度=%d%n",
-            classLeft.size(), classRight.size(), dim);
+        List<RealVector> clA = new ArrayList<>();
+        List<RealVector> clB = new ArrayList<>();
 
-        RealVector mu1 = computeMean(classLeft);
-        RealVector mu2 = computeMean(classRight);
+        for (int i = 0; i < features.size(); i++) {
+            RealVector f = new ArrayRealVector(features.get(i));
+            if (labels.get(i) == labelA) clA.add(f);
+            else clB.add(f);
+        }
 
-        RealMatrix Sw = computeScatterMatrix(classLeft, mu1)
-            .add(computeScatterMatrix(classRight, mu2));
+        if (clA.isEmpty() || clB.isEmpty()) {
+            System.err.printf("LDA: 某类无样本 (A=%d: %d, B=%d: %d)%n",
+                labelA, clA.size(), labelB, clB.size());
+            return;
+        }
 
-        // 自适应正则化: λ = trace(Sw) / dim * 1e-3
+        int dim = clA.get(0).getDimension();
+        RealVector muA = mean(clA);
+        RealVector muB = mean(clB);
+        RealMatrix Sw = scatter(clA, muA).add(scatter(clB, muB));
+
         double traceSw = 0;
         for (int i = 0; i < dim; i++) traceSw += Sw.getEntry(i, i);
         double lambda = Math.max(traceSw / dim * 1e-3, 1e-8);
 
         RealMatrix I = MatrixUtils.createRealIdentityMatrix(dim);
         RealMatrix SwReg = Sw.add(I.scalarMultiply(lambda));
-
-        RealVector diff = mu1.subtract(mu2);
+        RealVector diff = muA.subtract(muB); // A均值 - B均值
 
         RealMatrix SwInv;
         try {
             SwInv = new LUDecomposition(SwReg).getSolver().getInverse();
         } catch (SingularMatrixException e) {
-            // 降级：增大 λ
             SwReg = Sw.add(I.scalarMultiply(lambda * 100));
             try {
                 SwInv = new LUDecomposition(SwReg).getSolver().getInverse();
             } catch (SingularMatrixException e2) {
-                // 最终降级：SVD 伪逆
                 SwInv = new SingularValueDecomposition(SwReg).getSolver().getInverse();
             }
         }
 
         this.weights = SwInv.operate(diff);
-        this.threshold = weights.dotProduct(mu1.add(mu2).mapMultiply(0.5));
+        // 阈值 = w · (μA + μB) / 2
+        this.threshold = weights.dotProduct(muA.add(muB).mapMultiply(0.5));
 
-        System.out.printf("  LDA 完成, λ=%.6f, ||w||=%.4f%n", lambda, weights.getNorm());
+        System.out.printf("    LDA: A=%d(%d样本) B=%d(%d样本) dim=%d%n",
+            labelA, clA.size(), labelB, clB.size(), dim);
     }
 
     /**
-     * 用特征向量预测
+     * 预测：返回训练时记住的 labelA 或 labelB
      */
     public int predict(double[] features) {
-        RealVector feat = new ArrayRealVector(features);
-        double projection = weights.dotProduct(feat);
-        return (projection > threshold) ? 769 : 770;
+        double proj = rawProjection(features);
+        return (proj > threshold) ? labelA : labelB;
     }
 
-    private RealVector computeMean(List<RealVector> list) {
+    /**
+     * 到决策边界的距离（正数），用于置信度估计
+     */
+    public double projectionDistance(double[] features) {
+        return Math.abs(rawProjection(features) - threshold);
+    }
+
+    private double rawProjection(double[] features) {
+        RealVector feat = new ArrayRealVector(features);
+        return weights.dotProduct(feat);
+    }
+
+    private RealVector mean(List<RealVector> list) {
         RealVector sum = new ArrayRealVector(list.get(0).getDimension());
         for (RealVector v : list) sum = sum.add(v);
         return sum.mapDivide(list.size());
     }
 
-    private RealMatrix computeScatterMatrix(List<RealVector> list, RealVector mu) {
+    private RealMatrix scatter(List<RealVector> list, RealVector mu) {
         int dim = mu.getDimension();
-        RealMatrix matrix = MatrixUtils.createRealMatrix(dim, dim);
+        RealMatrix mat = MatrixUtils.createRealMatrix(dim, dim);
         for (RealVector v : list) {
-            RealVector diff = v.subtract(mu);
-            matrix = matrix.add(diff.outerProduct(diff));
+            RealVector d = v.subtract(mu);
+            mat = mat.add(d.outerProduct(d));
         }
-        return matrix;
+        return mat;
     }
 }

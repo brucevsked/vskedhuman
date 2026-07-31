@@ -4,8 +4,8 @@ import org.apache.commons.math3.linear.*;
 import java.util.*;
 
 /**
- * 滤波器组共空间模式 (Filter Bank Common Spatial Patterns)
- * 8 频段 × 3 对 CSP = 48 维原始特征
+ * 滤波器组共空间模式 — 二分类版本
+ * 按指定的两个类别训练 CSP（如 769 vs 770）
  */
 public class FBCCSPFilter {
 
@@ -17,87 +17,79 @@ public class FBCCSPFilter {
         this.numCSPPairs = numCSPPairs;
     }
 
-    public void fit(List<Trial> trials, double[][] bands) {
+    /**
+     * 在两个类别之间训练 CSP
+     * @param labelA 类别A标签（如 769）
+     * @param labelB 类别B标签（如 770）
+     */
+    public void fit(List<Trial> trials, double[][] bands, int labelA, int labelB) {
         this.freqBands = bands;
         this.cspFilters = new RealMatrix[bands.length];
 
         for (int b = 0; b < bands.length; b++) {
             double low = bands[b][0];
             double high = bands[b][1];
-            System.out.printf("  频段 %d: %.0f-%.0f Hz — 训练 CSP...%n", b + 1, low, high);
 
-            List<double[][]> bandLeft = new ArrayList<>();
-            List<double[][]> bandRight = new ArrayList<>();
+            List<double[][]> bandA = new ArrayList<>();
+            List<double[][]> bandB = new ArrayList<>();
 
             for (Trial t : trials) {
+                if (t.label != labelA && t.label != labelB) continue;
                 double[][] filtered = SignalProcessor.bandpassFilterTrial(t, low, high);
-                if (t.label == 769) bandLeft.add(filtered);
-                else if (t.label == 770) bandRight.add(filtered);
+                if (t.label == labelA) bandA.add(filtered);
+                else bandB.add(filtered);
             }
 
-            if (bandLeft.isEmpty() || bandRight.isEmpty()) {
-                System.out.printf("  警告: 频段 %d 某类样本为空，跳过%n", b + 1);
-                continue;
-            }
-            cspFilters[b] = trainCSP(bandLeft, bandRight);
+            if (bandA.isEmpty() || bandB.isEmpty()) continue;
+            cspFilters[b] = trainCSP(bandA, bandB);
         }
-        int validBands = (int) Arrays.stream(cspFilters).filter(Objects::nonNull).count();
-        System.out.printf("CSP 训练完成：%d 频段 × %d 对 = %d 维原始特征%n",
-            validBands, numCSPPairs, validBands * numCSPPairs * 2);
+        int valid = (int) Arrays.stream(cspFilters).filter(Objects::nonNull).count();
+        System.out.printf("    [%d vs %d] CSP: %d 频段有效, 共 %d 维%n",
+            labelA, labelB, valid, valid * numCSPPairs * 2);
     }
 
     public double[] extractFeatures(Trial trial) {
-        List<Double> allFeatures = new ArrayList<>();
+        List<Double> all = new ArrayList<>();
         for (int b = 0; b < freqBands.length; b++) {
             if (cspFilters[b] == null) continue;
             double[][] filtered = SignalProcessor.bandpassFilterTrial(trial,
                 freqBands[b][0], freqBands[b][1]);
             double[][] cspOut = applyCSP(filtered, cspFilters[b]);
             for (int ch = 0; ch < cspOut.length; ch++) {
-                double v = computeVariance(cspOut[ch]);
-                allFeatures.add(Math.log(Math.max(v, 1e-10)));
+                all.add(Math.log(Math.max(computeVariance(cspOut[ch]), 1e-10)));
             }
         }
-        double[] result = new double[allFeatures.size()];
-        for (int i = 0; i < result.length; i++) result[i] = allFeatures.get(i);
+        double[] result = new double[all.size()];
+        for (int i = 0; i < result.length; i++) result[i] = all.get(i);
         return result;
     }
 
     // ============ 标准 CSP ============
 
-    private RealMatrix trainCSP(List<double[][]> classLeft, List<double[][]> classRight) {
-        int channels = classLeft.get(0).length;
+    private RealMatrix trainCSP(List<double[][]> classA, List<double[][]> classB) {
+        int channels = classA.get(0).length;
         int n = channels;
 
-        RealMatrix covLeft = avgCov(classLeft);
-        RealMatrix covRight = avgCov(classRight);
-        RealMatrix R = covLeft.add(covRight);
+        RealMatrix covA = avgCov(classA);
+        RealMatrix covB = avgCov(classB);
+        RealMatrix R = covA.add(covB);
 
-        // 对 R 做特征分解: R = U * D * U^T
         EigenDecomposition eigR = new EigenDecomposition(R);
         RealMatrix U = eigR.getV();
         double[] ev = eigR.getRealEigenvalues();
 
-        // 白化矩阵: P = D^(-1/2) * U^T
         double[] diagInvSqrt = new double[n];
-        for (int i = 0; i < n; i++) {
-            diagInvSqrt[i] = 1.0 / Math.sqrt(Math.max(ev[i], 1e-8));
-        }
+        for (int i = 0; i < n; i++) diagInvSqrt[i] = 1.0 / Math.sqrt(Math.max(ev[i], 1e-8));
         RealMatrix Dinv = MatrixUtils.createRealDiagonalMatrix(diagInvSqrt);
         RealMatrix P = Dinv.multiply(U.transpose());
 
-        // S1 = P * covLeft * P^T
-        RealMatrix S1 = P.multiply(covLeft).multiply(P.transpose());
-
-        // S1 的特征分解
+        RealMatrix S1 = P.multiply(covA).multiply(P.transpose());
         EigenDecomposition eigS1 = new EigenDecomposition(S1);
         RealMatrix B = eigS1.getV();
         double[] lambda = eigS1.getRealEigenvalues();
 
-        // 完整 CSP 投影: WFull = B^T * P
         RealMatrix WFull = B.transpose().multiply(P);
 
-        // 按特征值降序排列，取前 numCSPPairs 和后 numCSPPairs
         int dim = lambda.length;
         Integer[] idx = new Integer[dim];
         for (int i = 0; i < dim; i++) idx[i] = i;
@@ -106,11 +98,9 @@ public class FBCCSPFilter {
         int numFilters = Math.min(numCSPPairs * 2, dim);
         RealMatrix W = MatrixUtils.createRealMatrix(numFilters, dim);
 
-        // 前 numCSPPairs 行 = 最大特征值对应的方向（classLeft 方差最大）
         for (int i = 0; i < numCSPPairs && i < numFilters; i++) {
             W.setRowVector(i, WFull.getRowVector(idx[i]));
         }
-        // 后 numCSPPairs 行 = 最小特征值对应的方向（classRight 方差最大）
         for (int i = 0; i < numCSPPairs && (numCSPPairs + i) < numFilters; i++) {
             W.setRowVector(numCSPPairs + i, WFull.getRowVector(idx[dim - 1 - i]));
         }

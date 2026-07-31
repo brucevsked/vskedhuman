@@ -3,63 +3,93 @@ package com.vsked.bci;
 import java.util.*;
 
 /**
- * 基于 Fisher Score 的特征选择器
- * FisherScore(f) = (μ1-μ2)² / (σ1²+σ2²)
- * 选择分离度最高的 top-k 特征
+ * 基于 Fisher Score (ANOVA F-statistic) 的特征选择器
+ *
+ * 支持二分类和多分类：多分类使用 one-vs-rest 平均
  */
 public class FeatureSelector {
 
     /**
-     * 计算所有特征的 Fisher Score 并返回 top-k 索引
+     * 多分类 ANOVA F-score 特征选择
+     * score(f) = between_class_variance / within_class_variance
+     * between = Σ_c n_c * (μ_c - μ)^2
+     * within  = Σ_c Σ_{i in c} (x_i - μ_c)^2
      */
-    public static int[] selectTopK(List<double[]> features, List<Integer> labels, int k) {
+    public static int[] selectTopKMulti(List<double[]> features, List<Integer> labels, int k) {
         int numFeatures = features.get(0).length;
+        int N = features.size();
 
-        // 按标签分组
-        List<double[]> classLeft = new ArrayList<>();
-        List<double[]> classRight = new ArrayList<>();
+        // 收集所有出现的类别
+        Set<Integer> classSet = new LinkedHashSet<>(labels);
+        List<Integer> classList = new ArrayList<>(classSet);
+        int numClasses = classList.size();
 
-        for (int i = 0; i < features.size(); i++) {
-            if (labels.get(i) == 769) classLeft.add(features.get(i));
-            else classRight.add(features.get(i));
+        if (numClasses <= 1) {
+            // 退化为取前 k 个方差最大的特征
+            return selectByVariance(features, k);
         }
 
-        // 计算每个特征的 Fisher Score
-        FisherScore[] scores = new FisherScore[numFeatures];
+        // 按类别分组
+        Map<Integer, List<double[]>> groups = new LinkedHashMap<>();
+        Map<Integer, int[]> groupIndices = new LinkedHashMap<>();
+        for (int cls : classList) groups.put(cls, new ArrayList<>());
+        for (int i = 0; i < N; i++) groups.get(labels.get(i)).add(features.get(i));
+
+        // 计算每个特征的 ANOVA F-score
+        Score[] scores = new Score[numFeatures];
         for (int f = 0; f < numFeatures; f++) {
-            double mean1 = 0, mean2 = 0;
-            for (double[] feats : classLeft) mean1 += feats[f];
-            for (double[] feats : classRight) mean2 += feats[f];
-            mean1 /= classLeft.size();
-            mean2 /= classRight.size();
+            // 每类均值 + 全局均值
+            double globalMean = 0;
+            double[] classMeans = new double[numClasses];
+            int[] classCounts = new int[numClasses];
 
-            double var1 = 0, var2 = 0;
-            for (double[] feats : classLeft) var1 += Math.pow(feats[f] - mean1, 2);
-            for (double[] feats : classRight) var2 += Math.pow(feats[f] - mean2, 2);
-            var1 /= classLeft.size();
-            var2 /= classRight.size();
+            for (int c = 0; c < numClasses; c++) {
+                int cls = classList.get(c);
+                List<double[]> group = groups.get(cls);
+                classCounts[c] = group.size();
+                double sum = 0;
+                for (double[] feats : group) sum += feats[f];
+                classMeans[c] = sum / classCounts[c];
+                globalMean += sum;
+            }
+            globalMean /= N;
 
-            double score = (var1 + var2) > 1e-12
-                ? (mean1 - mean2) * (mean1 - mean2) / (var1 + var2)
-                : 0;
-            scores[f] = new FisherScore(f, score);
+            // between-class variance
+            double between = 0;
+            for (int c = 0; c < numClasses; c++) {
+                double diff = classMeans[c] - globalMean;
+                between += classCounts[c] * diff * diff;
+            }
+            between /= (numClasses - 1);
+
+            // within-class variance
+            double within = 0;
+            for (int c = 0; c < numClasses; c++) {
+                int cls = classList.get(c);
+                for (double[] feats : groups.get(cls)) {
+                    double diff = feats[f] - classMeans[c];
+                    within += diff * diff;
+                }
+            }
+            within /= (N - numClasses);
+
+            double score = (within > 1e-12) ? between / within : 0;
+            scores[f] = new Score(f, score);
         }
 
-        // 排序取 top-k
-        Arrays.sort(scores, (a, b) -> Double.compare(b.score, a.score));
+        Arrays.sort(scores, (a, b) -> Double.compare(b.value, a.value));
 
-        int[] selected = new int[k];
-        for (int i = 0; i < k; i++) selected[i] = scores[i].index;
+        int[] selected = new int[Math.min(k, numFeatures)];
+        for (int i = 0; i < selected.length; i++) selected[i] = scores[i].index;
 
-        // 打印选中的特征信息
-        System.out.printf("特征选择: 从 %d 维中选出 top-%d, 最高 Fisher=%.4f, 最低=%.4f%n",
-            numFeatures, k, scores[0].score, scores[k - 1].score);
+        System.out.printf("特征选择: 从 %d 维中选出 top-%d, 最高 F=%.4f, 最低=%.4f%n",
+                numFeatures, selected.length, scores[0].value, scores[selected.length - 1].value);
 
         return selected;
     }
 
     /**
-     * 应用特征选择：从完整特征中提取被选中的维度
+     * 从完整特征中提取被选中的维度
      */
     public static double[] applySelection(double[] fullFeatures, int[] selectedIndices) {
         double[] result = new double[selectedIndices.length];
@@ -69,13 +99,46 @@ public class FeatureSelector {
         return result;
     }
 
-    private static class FisherScore {
-        int index;
-        double score;
+    /**
+     * 对所有特征列表批量应用选择
+     */
+    public static List<double[]> applySelectionBatch(List<double[]> features, int[] selectedIndices) {
+        List<double[]> result = new ArrayList<>();
+        for (double[] f : features) {
+            result.add(applySelection(f, selectedIndices));
+        }
+        return result;
+    }
 
-        FisherScore(int index, double score) {
+    private static int[] selectByVariance(List<double[]> features, int k) {
+        int D = features.get(0).length;
+        int N = features.size();
+        Score[] scores = new Score[D];
+
+        double[] means = new double[D];
+        for (double[] f : features)
+            for (int d = 0; d < D; d++) means[d] += f[d];
+        for (int d = 0; d < D; d++) means[d] /= N;
+
+        for (int d = 0; d < D; d++) {
+            double var = 0;
+            for (double[] f : features) var += Math.pow(f[d] - means[d], 2);
+            scores[d] = new Score(d, var / N);
+        }
+        Arrays.sort(scores, (a, b) -> Double.compare(b.value, a.value));
+
+        int[] selected = new int[Math.min(k, D)];
+        for (int i = 0; i < selected.length; i++) selected[i] = scores[i].index;
+        return selected;
+    }
+
+    private static class Score {
+        int index;
+        double value;
+
+        Score(int index, double value) {
             this.index = index;
-            this.score = score;
+            this.value = value;
         }
     }
 }
